@@ -11,10 +11,8 @@
   4. seen.json 저장
 """
 
-import json
 import logging
 import sys
-import time
 
 from calendar_service import (
     build_listing_event,
@@ -40,20 +38,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# #region agent log
-_DEBUG_LOG = "/Users/tia.lee/Documents/dev-cursor/.cursor/debug-0ca51e.log"
-
-
-def _dbg(msg: str, data: dict, hypothesis: str) -> None:
-    entry = {
-        "sessionId": "0ca51e", "runId": "post-fix", "hypothesisId": hypothesis,
-        "location": "main.py", "message": msg, "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-# #endregion
 
 # 청약 데이터 해시 대상 키
 SUBSCRIPTION_HASH_KEYS = ["공모가", "경쟁률", "주간사"]
@@ -151,21 +135,10 @@ def run() -> None:
     logger.info("공모주 캘린더 자동화 시작")
     logger.info("=" * 60)
 
-    # #region agent log
-    import os
-    _dbg("스크립트 시작", {"cwd": os.getcwd(), "python": sys.executable}, "A")
-    # #endregion
-
     # Google Calendar 서비스 초기화
     try:
         service = get_calendar_service()
-        # #region agent log
-        _dbg("Google Calendar 초기화 성공", {}, "B")
-        # #endregion
     except FileNotFoundError as exc:
-        # #region agent log
-        _dbg("Google Calendar 초기화 실패", {"error": str(exc)}, "B")
-        # #endregion
         logger.error(str(exc))
         sys.exit(1)
 
@@ -197,12 +170,6 @@ def run() -> None:
 
     # ── Slack 알림 발송 ────────────────────────────────────────────
     logger.info("── Slack 알림 확인 중 ──")
-    # #region agent log
-    _dbg("Slack 알림 직전", {
-        "subscription_count": len(subscription_items),
-        "listing_count": len(listing_items),
-    }, "D")
-    # #endregion
     send_slack_alerts(subscription_items, listing_items)
 
     logger.info("=" * 60)
