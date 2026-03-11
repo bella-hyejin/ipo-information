@@ -1,0 +1,58 @@
+name: IPO 공모주 알림
+
+on:
+  schedule:
+    # 매일 23:00 UTC = 08:00 KST (UTC+9)
+    - cron: '0 23 * * *'
+  # 수동 실행 (GitHub Actions 탭에서 Run workflow 버튼으로 테스트 가능)
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: seen.json 캐시 복원 (중복 처리 방지)
+        uses: actions/cache@v4
+        with:
+          path: seen.json
+          key: seen-json-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            seen-json-${{ runner.os }}-
+
+      - name: Google 인증 파일 생성
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+          echo '${{ secrets.GOOGLE_TOKEN_JSON }}'       > token.json
+
+      - name: .env 생성
+        run: |
+          echo "SLACK_BOT_TOKEN=${{ secrets.SLACK_BOT_TOKEN }}"     >> .env
+          echo "SLACK_CHANNEL_ID=${{ secrets.SLACK_CHANNEL_ID }}"   >> .env
+          echo "GOOGLE_CREDENTIALS_FILE=credentials.json"           >> .env
+          echo "GOOGLE_TOKEN_FILE=token.json"                       >> .env
+          echo "GOOGLE_CALENDAR_ID=primary"                         >> .env
+
+      - name: 공모주 알림 실행
+        run: python src/main.py
+
+      - name: 실행 로그 아티팩트 저장 (실패 시 디버깅용)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
