@@ -4,14 +4,22 @@
 실행:
     python src/main.py
 
+환경변수:
+    RUN_MODE: morning(기본) | open | close
+      - morning (08:00 KST): 신규/변경 종목 알림 + 상장 당일 알림
+      - open    (10:00 KST): 청약시작일==오늘 종목 알림
+      - close   (18:00 KST): 청약마감일<=오늘이면서 변경된 종목 알림
+
 흐름:
   1. 38.co.kr 크롤링 (청약일정 + 신규상장)
   2. seen.json 로드 → 신규/변경 여부 판별
   3. Google Calendar 이벤트 생성 또는 description 업데이트
   4. seen.json 저장
+  5. RUN_MODE에 따라 Slack 알림 발송
 """
 
 import logging
+import os
 import sys
 
 from calendar_service import (
@@ -30,7 +38,11 @@ from seen_manager import (
     save_seen,
     upsert_record,
 )
-from slack_service import send_slack_alerts
+from slack_service import (
+    send_close_update_alerts,
+    send_morning_alerts,
+    send_open_alerts,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +50,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# 실행 모드: morning | open | close
+RUN_MODE = os.getenv("RUN_MODE", "morning")
 
 # 청약 데이터 해시 대상 키
 SUBSCRIPTION_HASH_KEYS = ["공모가", "경쟁률", "주간사"]
@@ -57,8 +72,15 @@ def _build_listing_description(item: dict) -> str:
     return f"공모가: {item.get('공모가', '미정')}"
 
 
-def _process_subscription(service, seen: dict, item: dict) -> None:
-    """청약일정 한 건을 처리한다 (신규 생성 또는 변경 업데이트)."""
+def _process_subscription(service, seen: dict, item: dict) -> str:
+    """
+    청약일정 한 건을 처리한다 (신규 생성 또는 변경 업데이트).
+
+    Returns:
+        "new"     - 신규 이벤트 생성
+        "updated" - 데이터 변경으로 이벤트 업데이트
+        "skipped" - 변경 없음 또는 처리 실패
+    """
     name = item["종목명"]
     data_hash = compute_hash(item, SUBSCRIPTION_HASH_KEYS)
     record = get_record(seen, "subscriptions", name)
@@ -69,7 +91,7 @@ def _process_subscription(service, seen: dict, item: dict) -> None:
         if existing_id:
             logger.info("[청약] %s: 캘린더에 존재 → seen.json 복원", name)
             upsert_record(seen, "subscriptions", name, existing_id, data_hash)
-            return
+            return "new"
 
         # 완전 신규 → 이벤트 생성
         try:
@@ -77,8 +99,10 @@ def _process_subscription(service, seen: dict, item: dict) -> None:
             event_id = create_event(service, body)
             upsert_record(seen, "subscriptions", name, event_id, data_hash)
             logger.info("[청약] %s: 신규 이벤트 생성 완료", name)
+            return "new"
         except (ValueError, Exception) as exc:
             logger.warning("[청약] %s: 이벤트 생성 실패 (%s)", name, exc)
+            return "skipped"
 
     elif record["data_hash"] != data_hash:
         # 데이터 변경 → description 업데이트
@@ -87,14 +111,24 @@ def _process_subscription(service, seen: dict, item: dict) -> None:
             update_event_description(service, record["event_id"], new_desc)
             upsert_record(seen, "subscriptions", name, record["event_id"], data_hash)
             logger.info("[청약] %s: 이벤트 설명 업데이트 완료", name)
+            return "updated"
         except Exception as exc:
             logger.warning("[청약] %s: 이벤트 업데이트 실패 (%s)", name, exc)
+            return "skipped"
     else:
         logger.debug("[청약] %s: 변경 없음, 스킵", name)
+        return "skipped"
 
 
-def _process_listing(service, seen: dict, item: dict) -> None:
-    """신규상장 한 건을 처리한다 (신규 생성 또는 변경 업데이트)."""
+def _process_listing(service, seen: dict, item: dict) -> str:
+    """
+    신규상장 한 건을 처리한다 (신규 생성 또는 변경 업데이트).
+
+    Returns:
+        "new"     - 신규 이벤트 생성
+        "updated" - 데이터 변경으로 이벤트 업데이트
+        "skipped" - 변경 없음 또는 처리 실패
+    """
     name = item["종목명"]
     data_hash = compute_hash(item, LISTING_HASH_KEYS)
     record = get_record(seen, "listings", name)
@@ -105,7 +139,7 @@ def _process_listing(service, seen: dict, item: dict) -> None:
         if existing_id:
             logger.info("[상장] %s: 캘린더에 존재 → seen.json 복원", name)
             upsert_record(seen, "listings", name, existing_id, data_hash)
-            return
+            return "new"
 
         # 완전 신규 → 이벤트 생성
         try:
@@ -113,8 +147,10 @@ def _process_listing(service, seen: dict, item: dict) -> None:
             event_id = create_event(service, body)
             upsert_record(seen, "listings", name, event_id, data_hash)
             logger.info("[상장] %s: 신규 이벤트 생성 완료", name)
+            return "new"
         except (ValueError, Exception) as exc:
             logger.warning("[상장] %s: 이벤트 생성 실패 (%s)", name, exc)
+            return "skipped"
 
     elif record["data_hash"] != data_hash:
         # 데이터 변경 → description 업데이트
@@ -123,16 +159,19 @@ def _process_listing(service, seen: dict, item: dict) -> None:
             update_event_description(service, record["event_id"], new_desc)
             upsert_record(seen, "listings", name, record["event_id"], data_hash)
             logger.info("[상장] %s: 이벤트 설명 업데이트 완료", name)
+            return "updated"
         except Exception as exc:
             logger.warning("[상장] %s: 이벤트 업데이트 실패 (%s)", name, exc)
+            return "skipped"
     else:
         logger.debug("[상장] %s: 변경 없음, 스킵", name)
+        return "skipped"
 
 
 def run() -> None:
     """메인 실행 함수."""
     logger.info("=" * 60)
-    logger.info("공모주 캘린더 자동화 시작")
+    logger.info("공모주 캘린더 자동화 시작 [모드: %s]", RUN_MODE)
     logger.info("=" * 60)
 
     # Google Calendar 서비스 초기화
@@ -149,9 +188,15 @@ def run() -> None:
     subscription_items = crawl_subscription_schedule()
     logger.info("청약일정 %d건 수집", len(subscription_items))
 
+    new_subs: list[dict] = []
+    changed_subs: list[dict] = []
     for item in subscription_items:
         try:
-            _process_subscription(service, seen, item)
+            status = _process_subscription(service, seen, item)
+            if status == "new":
+                new_subs.append(item)
+            elif status == "updated":
+                changed_subs.append(item)
         except Exception as exc:
             logger.error("청약일정 처리 중 예외 (건너뜀): %s – %s", item.get("종목명"), exc)
 
@@ -160,17 +205,41 @@ def run() -> None:
     listing_items = crawl_new_listings()
     logger.info("신규상장 %d건 수집", len(listing_items))
 
+    new_listings: list[dict] = []
+    changed_listings: list[dict] = []
     for item in listing_items:
         try:
-            _process_listing(service, seen, item)
+            status = _process_listing(service, seen, item)
+            if status == "new":
+                new_listings.append(item)
+            elif status == "updated":
+                changed_listings.append(item)
         except Exception as exc:
             logger.error("신규상장 처리 중 예외 (건너뜀): %s – %s", item.get("종목명"), exc)
 
     save_seen(seen)
 
-    # ── Slack 알림 발송 ────────────────────────────────────────────
-    logger.info("── Slack 알림 확인 중 ──")
-    send_slack_alerts(subscription_items, listing_items)
+    # ── Slack 알림 발송 (모드별 분기) ──────────────────────────────
+    logger.info("── Slack 알림 확인 중 [모드: %s] ──", RUN_MODE)
+    if RUN_MODE == "morning":
+        send_morning_alerts(
+            subscription_items,
+            listing_items,
+            new_subs + changed_subs,
+            new_listings + changed_listings,
+        )
+    elif RUN_MODE == "open":
+        send_open_alerts(subscription_items)
+    elif RUN_MODE == "close":
+        send_close_update_alerts(changed_subs)
+    else:
+        logger.warning("알 수 없는 RUN_MODE=%r → morning 모드로 대체 실행", RUN_MODE)
+        send_morning_alerts(
+            subscription_items,
+            listing_items,
+            new_subs + changed_subs,
+            new_listings + changed_listings,
+        )
 
     logger.info("=" * 60)
     logger.info("완료: 청약 %d건 / 신규상장 %d건 처리", len(subscription_items), len(listing_items))

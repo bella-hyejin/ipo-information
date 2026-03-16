@@ -2,10 +2,19 @@ name: IPO 공모주 알림
 
 on:
   schedule:
-    # 매일 23:00 UTC = 08:00 KST (UTC+9)
+    # 08:00 KST (UTC+9) = UTC 23:00 (전날) → morning 모드
     - cron: '0 23 * * *'
+    # 10:00 KST = UTC 01:00 → open 모드 (청약 시작일 알림)
+    - cron: '0 1 * * *'
+    # 18:00 KST = UTC 09:00 → close 모드 (청약 마감 후 업데이트 알림)
+    - cron: '0 9 * * *'
   # 수동 실행 (GitHub Actions 탭에서 Run workflow 버튼으로 테스트 가능)
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: '실행 모드: morning(08시 업데이트+상장) | open(10시 청약시작) | close(18시 마감후업데이트)'
+        required: false
+        default: morning
 
 jobs:
   notify:
@@ -44,6 +53,18 @@ jobs:
           echo "GOOGLE_CREDENTIALS_FILE=credentials.json"           >> .env
           echo "GOOGLE_TOKEN_FILE=token.json"                       >> .env
           echo "GOOGLE_CALENDAR_ID=primary"                         >> .env
+
+      - name: 실행 모드(RUN_MODE) 설정
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 23 * * *" ]; then
+            echo "RUN_MODE=morning" >> $GITHUB_ENV
+          elif [ "${{ github.event.schedule }}" = "0 1 * * *" ]; then
+            echo "RUN_MODE=open" >> $GITHUB_ENV
+          elif [ "${{ github.event.schedule }}" = "0 9 * * *" ]; then
+            echo "RUN_MODE=close" >> $GITHUB_ENV
+          else
+            echo "RUN_MODE=${{ github.event.inputs.run_mode || 'morning' }}" >> $GITHUB_ENV
+          fi
 
       - name: 공모주 알림 실행
         run: python src/main.py

@@ -1,9 +1,10 @@
 """
 Slack 알림 발송 모듈.
 
-발송 조건:
-  - 청약 이벤트: 청약 마감일이 내일(오늘 + 1일)인 종목
-  - 상장 이벤트: 상장일이 오늘인 종목 (매일 08:00 실행 시 상장 1시간 전 효과)
+RUN_MODE별 발송 조건:
+  - morning (08:00 KST): 신규/변경 청약·상장 종목 알림 + 상장일==오늘 알림
+  - open    (10:00 KST): 청약시작일==오늘인 종목 알림
+  - close   (18:00 KST): 청약마감일<=오늘이면서 데이터가 변경된 종목 알림
 
 사전 준비:
   1. api.slack.com/apps 에서 앱 생성 후 chat:write 권한 추가
@@ -13,7 +14,7 @@ Slack 알림 발송 모듈.
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import date
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -116,53 +117,132 @@ def send_message(client: WebClient, text: str) -> bool:
         return False
 
 
-# ── 메인 알림 함수 ────────────────────────────────────────────────────────────
+# ── 클라이언트 초기화 헬퍼 ───────────────────────────────────────────────────
 
 
-def send_slack_alerts(
-    subscription_items: list[dict],
-    listing_items: list[dict],
-) -> None:
-    """
-    크롤 결과를 날짜 조건으로 필터링하여 Slack 알림을 발송한다.
-
-    Args:
-        subscription_items: crawl_subscription_schedule() 반환값.
-        listing_items: crawl_new_listings() 반환값.
-    """
+def _init_client() -> WebClient | None:
+    """토큰 검증 후 WebClient를 반환한다. 미설정 시 None을 반환한다."""
     if not SLACK_BOT_TOKEN:
         logger.warning("SLACK_BOT_TOKEN 미설정 → Slack 알림 건너뜀")
-        return
-
+        return None
     try:
-        client = get_slack_client()
+        return get_slack_client()
     except ValueError as exc:
         logger.error(str(exc))
+        return None
+
+
+# ── 모드별 알림 함수 ──────────────────────────────────────────────────────────
+
+
+def send_morning_alerts(
+    subscription_items: list[dict],
+    listing_items: list[dict],
+    updated_subs: list[dict],
+    updated_listings: list[dict],
+) -> None:
+    """
+    [morning 모드 / 08:00 KST] 기능 3 + 4 알림 발송.
+
+    - 기능 4: 신규·변경된 청약·상장 종목 알림
+    - 기능 3: 상장일==오늘인 종목 알림 (기능 4와 중복 발송 방지)
+
+    Args:
+        subscription_items: 전체 청약 크롤링 결과.
+        listing_items: 전체 상장 크롤링 결과.
+        updated_subs: 신규 또는 변경된 청약 종목 목록.
+        updated_listings: 신규 또는 변경된 상장 종목 목록.
+    """
+    client = _init_client()
+    if client is None:
         return
 
     today = date.today()
-    tomorrow = today + timedelta(days=1)
-
     sent = 0
 
-    # ── 청약 알림: 마감일 == 내일 ──────────────────────────────────────────
-    for item in subscription_items:
-        마감일 = _parse_date(item.get("청약마감일", ""))
-        if 마감일 != tomorrow:
-            continue
+    # ── 기능 4: 신규·변경 청약 종목 ───────────────────────────────────────
+    for item in updated_subs:
         text = format_subscription_message(item)
         if send_message(client, text):
             sent += 1
-            logger.info("[청약 알림] %s (마감일: %s)", item.get("종목명"), 마감일)
+            logger.info("[morning/청약 업데이트] %s", item.get("종목명"))
 
-    # ── 상장 알림: 상장일 == 오늘 ──────────────────────────────────────────
+    # ── 기능 4: 신규·변경 상장 종목 ───────────────────────────────────────
+    updated_listing_names = {item["종목명"] for item in updated_listings}
+    for item in updated_listings:
+        text = format_listing_message(item)
+        if send_message(client, text):
+            sent += 1
+            logger.info("[morning/상장 업데이트] %s", item.get("종목명"))
+
+    # ── 기능 3: 상장일==오늘 (기능 4에서 이미 보낸 종목 제외) ───────────
     for item in listing_items:
+        if item["종목명"] in updated_listing_names:
+            continue
         상장일 = _parse_date(item.get("상장일", ""))
         if 상장일 != today:
             continue
         text = format_listing_message(item)
         if send_message(client, text):
             sent += 1
-            logger.info("[상장 알림] %s (상장일: %s)", item.get("종목명"), 상장일)
+            logger.info("[morning/상장 당일] %s (상장일: %s)", item.get("종목명"), 상장일)
 
-    logger.info("Slack 알림 발송 완료: 총 %d건", sent)
+    logger.info("Slack 알림 발송 완료 (morning): 총 %d건", sent)
+
+
+def send_open_alerts(subscription_items: list[dict]) -> None:
+    """
+    [open 모드 / 10:00 KST] 기능 1 알림 발송.
+
+    청약시작일==오늘인 종목을 Slack으로 전달한다.
+
+    Args:
+        subscription_items: 전체 청약 크롤링 결과.
+    """
+    client = _init_client()
+    if client is None:
+        return
+
+    today = date.today()
+    sent = 0
+
+    for item in subscription_items:
+        시작일 = _parse_date(item.get("청약시작일", ""))
+        if 시작일 != today:
+            continue
+        text = format_subscription_message(item)
+        if send_message(client, text):
+            sent += 1
+            logger.info("[open/청약시작] %s (시작일: %s)", item.get("종목명"), 시작일)
+
+    logger.info("Slack 알림 발송 완료 (open): 총 %d건", sent)
+
+
+def send_close_update_alerts(changed_subs: list[dict]) -> None:
+    """
+    [close 모드 / 18:00 KST] 기능 2 알림 발송.
+
+    청약마감일<=오늘이면서 데이터가 변경된 종목(경쟁률 확정 등)을 Slack으로 전달한다.
+
+    Args:
+        changed_subs: main.py에서 hash 변경이 감지된 청약 종목 목록.
+    """
+    client = _init_client()
+    if client is None:
+        return
+
+    today = date.today()
+    sent = 0
+
+    for item in changed_subs:
+        마감일 = _parse_date(item.get("청약마감일", ""))
+        if 마감일 is None or 마감일 > today:
+            continue
+        text = format_subscription_message(item)
+        if send_message(client, text):
+            sent += 1
+            logger.info(
+                "[close/마감후업데이트] %s (마감일: %s)", item.get("종목명"), 마감일
+            )
+
+    logger.info("Slack 알림 발송 완료 (close): 총 %d건", sent)
